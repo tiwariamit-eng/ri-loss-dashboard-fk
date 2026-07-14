@@ -4,6 +4,8 @@ RI Loss Analysis — Streamlit launcher for the exact HTML dashboard.
 """
 import io
 import json
+import os
+import tempfile
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -42,23 +44,25 @@ def find_file_id(service, folder_id, filename_contains):
     return files[0]["id"], files[0]["name"]
 
 
-def download_file_to_buffer(service, file_id):
+def download_file_to_disk(service, file_id):
+    """Stream the file straight to a temp file on disk instead of holding
+    the raw bytes in memory — critical for large (500MB-1GB+) CSVs."""
     request = service.files().get_media(fileId=file_id)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    buf.seek(0)
-    return buf
+    fd, path = tempfile.mkstemp(suffix=".csv")
+    with os.fdopen(fd, "wb") as f:
+        downloader = MediaIoBaseDownload(f, request, chunksize=10 * 1024 * 1024)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    return path
 
 
 @st.cache_data(show_spinner="Fetching RI Loss CSV from Google Drive...", ttl=600)
 def fetch_csv_from_drive(folder_id, filename_contains="RI_Final"):
     service = get_drive_service()
     file_id, file_name = find_file_id(service, folder_id, filename_contains)
-    buf = download_file_to_buffer(service, file_id)
-    return buf, file_name
+    path = download_file_to_disk(service, file_id)
+    return path, file_name
 
 
 USE = ["warehouse_id","business_unit","zone","FC Zone","Month",
@@ -68,44 +72,78 @@ USE = ["warehouse_id","business_unit","zone","FC Zone","Month",
        "BGM Eligible brand","BGM Eligible Mapping",
        "final amount","quantity"]
 
+BU_KEEP = ["BGM","Electronics","LifeStyle","Home","LargeAppliances","Mobile"]
+
+CATEGORY_COLS = ["business_unit","zone","FC Zone","final_bucket",
+                  "product_detail_cms_vertical","brand","Vertical x Brand",
+                  "ekl_bf_last_recvd_dh_name","return_reason","return_sub_reason",
+                  "resealing eligible","tag reprinting status","rvp_rto_status",
+                  "BGM Eligible brand","BGM Eligible Mapping"]
+
+
+def _process_chunk(chunk):
+    """Row-level transforms + early scope filter, applied per chunk so
+    out-of-scope rows never accumulate across the full file."""
+    chunk["amt"] = pd.to_numeric(chunk["final amount"], errors="coerce").fillna(0.0)
+    chunk["u"]   = pd.to_numeric(chunk["quantity"], errors="coerce").fillna(0).astype(int)
+    chunk["fcz"] = chunk["FC Zone"].fillna("Unknown")
+    chunk["z"]   = chunk["zone"].fillna("Unknown")
+    chunk["wh"]  = chunk["warehouse_id"].astype(str)
+    chunk["bu"]  = chunk["business_unit"].fillna("Unknown")
+    chunk["fb"]  = chunk["final_bucket"].fillna("Unknown")
+    chunk["m"]   = chunk["Month"].astype(str).str.strip()
+    chunk["v"]   = chunk["product_detail_cms_vertical"].fillna("Unknown")
+    chunk["sr"]  = chunk["return_sub_reason"].fillna("Unknown")
+    chunk["br"]  = chunk["brand"].fillna("Unknown")
+    chunk["vxb"] = chunk["Vertical x Brand"].fillna("Unknown")
+    chunk["dh"]  = chunk["ekl_bf_last_recvd_dh_name"].fillna("Not Tagged").replace("", "Not Tagged")
+    chunk["reason"] = chunk["return_reason"].fillna("Unknown")
+    chunk["resel"]  = chunk["resealing eligible"].fillna("N/A").replace("", "N/A")
+    chunk["tagr"]   = chunk["tag reprinting status"].fillna("N/A").replace("", "N/A")
+    chunk["bgmb"]   = chunk["BGM Eligible brand"].fillna("N/A").replace("", "N/A")
+    chunk["bgmm"]   = chunk["BGM Eligible Mapping"].fillna("N/A").replace("", "N/A")
+    chunk["rr"]     = chunk["rvp_rto_status"].astype(str).str.upper().where(
+                        chunk["rvp_rto_status"].notna(), "Unknown").replace({"": "Unknown", "NAN": "Unknown"})
+
+    # scope filter FIRST — drop out-of-scope rows before they ever pile up
+    chunk = chunk[chunk["bu"].isin(BU_KEEP)]
+    chunk = chunk[chunk["m"].str.fullmatch(r"\d{6}")]
+
+    # drop the now-redundant raw source columns to shrink memory further
+    chunk = chunk.drop(columns=[c for c in USE if c in chunk.columns])
+
+    # downcast repeated strings to category to save memory
+    for c in ["fcz","z","bu","fb","v","sr","br","vxb","dh","reason",
+              "resel","tagr","bgmb","bgmm","rr"]:
+        chunk[c] = chunk[c].astype("category")
+
+    return chunk
+
+
 @st.cache_data(show_spinner=True)
-def load_data(source):
+def load_data(path):
+    chunks = []
     try:
-        df = pd.read_csv(source, usecols=lambda c: c in USE, low_memory=False)
+        reader = pd.read_csv(path, usecols=lambda c: c in USE, low_memory=False, chunksize=200_000)
     except TypeError:
         # older pandas versions don't support usecols as a callable
-        df = pd.read_csv(source, low_memory=False)
-        df = df[[c for c in df.columns if c in USE]]
-    df["amt"] = pd.to_numeric(df["final amount"], errors="coerce").fillna(0.0)
-    df["u"]   = pd.to_numeric(df["quantity"], errors="coerce").fillna(0).astype(int)
-    df["fcz"] = df["FC Zone"].fillna("Unknown")
-    df["z"]   = df["zone"].fillna("Unknown")
-    df["wh"]  = df["warehouse_id"].astype(str)
-    df["bu"]  = df["business_unit"].fillna("Unknown")
-    df["fb"]  = df["final_bucket"].fillna("Unknown")
-    df["m"]   = df["Month"].astype(str).str.strip()
-    df["v"]   = df["product_detail_cms_vertical"].fillna("Unknown")
-    df["sr"]  = df["return_sub_reason"].fillna("Unknown")
-    df["br"]  = df["brand"].fillna("Unknown")
-    df["vxb"] = df["Vertical x Brand"].fillna("Unknown")
-    df["dh"]  = df["ekl_bf_last_recvd_dh_name"].fillna("Not Tagged").replace("", "Not Tagged")
-    df["reason"] = df["return_reason"].fillna("Unknown")
-    df["resel"]  = df["resealing eligible"].fillna("N/A").replace("", "N/A")
-    df["tagr"]   = df["tag reprinting status"].fillna("N/A").replace("", "N/A")
-    df["bgmb"]   = df["BGM Eligible brand"].fillna("N/A").replace("", "N/A")
-    df["bgmm"]   = df["BGM Eligible Mapping"].fillna("N/A").replace("", "N/A")
-    df["rr"]     = df["rvp_rto_status"].astype(str).str.upper().where(
-                      df["rvp_rto_status"].notna(), "Unknown").replace({"": "Unknown", "NAN": "Unknown"})
-    
-    _topr = df.groupby("reason")["amt"].sum().sort_values(ascending=False).head(30).index
-    df["reason_c"] = df["reason"].where(df["reason"].isin(_topr), "Other")
+        reader = pd.read_csv(path, low_memory=False, chunksize=200_000)
 
-    BU_KEEP = ["BGM","Electronics","LifeStyle","Home","LargeAppliances","Mobile"]
-    before = len(df)
-    df = df[df["bu"].isin(BU_KEEP)].copy()
-    df = df[df["m"].str.fullmatch(r"\d{6}")].copy()
-    print(f"kept {len(df)} of {before} rows after BU/month scope filters",
-          "| months:", sorted(df["m"].unique().tolist()))
+    total_before = 0
+    for raw_chunk in reader:
+        if set(USE).issubset(raw_chunk.columns) is False:
+            raw_chunk = raw_chunk[[c for c in raw_chunk.columns if c in USE]]
+        total_before += len(raw_chunk)
+        chunks.append(_process_chunk(raw_chunk))
+
+    df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+
+    # top-30 reasons (needs the full filtered scope, but this is now small)
+    _topr = df.groupby("reason", observed=True)["amt"].sum().sort_values(ascending=False).head(30).index
+    df["reason_c"] = df["reason"].astype(str).where(df["reason"].isin(_topr), "Other").astype("category")
+
+    print(f"kept {len(df)} of {total_before} rows after BU/month scope filters",
+          "| months:", sorted(df["m"].astype(str).unique().tolist()))
     return df.reset_index(drop=True)
 
 
@@ -1005,14 +1043,14 @@ def main():
         fetch_csv_from_drive.clear()
 
     try:
-        buf, file_name = fetch_csv_from_drive(RI_LOSS_FOLDER_ID, filename_contains="RI_Final")
+        csv_path, file_name = fetch_csv_from_drive(RI_LOSS_FOLDER_ID, filename_contains="RI_Final")
         st.sidebar.caption(f"Loaded: {file_name}")
     except Exception as e:
         st.error(f"Could not fetch RI Loss CSV from Google Drive: {e}")
         st.stop()
 
     try:
-        df = load_data(buf)
+        df = load_data(csv_path)
     except Exception as e:
         st.error(f"Could not parse the RI Loss CSV: {e}")
         st.stop()
