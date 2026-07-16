@@ -147,6 +147,7 @@ def load_data(path):
     return df.reset_index(drop=True)
 
 
+@st.cache_data(show_spinner="Building dashboard payload...")
 def build_payload(df):
     def cr(x): 
         return round(float(x) / 1e7, 4)
@@ -1057,6 +1058,7 @@ def main():
         
     payload = build_payload(df)
     data_str = json.dumps(payload, separators=(",", ":"))
+    print(f"payload JSON size: {len(data_str)/1e6:.2f} MB")
     html = TEMPLATE_HTML.replace("/*__RI_DATA__*/", data_str)
     components.html(html, height=height, scrolling=False) # Scrolling false maps outer panel to window bounds
 
